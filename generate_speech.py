@@ -14,8 +14,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import edge_tts
 import pyttsx3
-from loguru import logger
 from PyQt5.QtCore import QCoreApplication, QObject, pyqtSignal
+from loguru import logger
 
 from basic_dirs import CACHE_HOME
 
@@ -325,20 +325,53 @@ class EdgeTTSProvider(TTSVoiceProvider):
             future = self._executor.submit(_run_async)
             voices = future.result(timeout=10.0)
 
-            result: List[TTSVoice] = []
-            for voice in voices:
-                voice_obj: Any = voice
-                tts_voice = TTSVoice(
-                    id=voice_obj['ShortName'],
-                    name=voice_obj['FriendlyName'],
-                    language=voice_obj['Locale'][:2],
-                    gender=voice_obj['Gender'],
-                    engine=TTSEngine.EDGE,
-                    locale=voice_obj['Locale'],
-                )
-                result.append(tts_voice)
+            if not voices:
+                logger.warning("Edge TTS 返回空的语音列表")
+                return []
 
+            result: List[TTSVoice] = []
+            for i, voice in enumerate(voices):
+                try:
+                    voice_obj: Any = voice
+                    # 验证必需的字段是否存在
+                    required_fields = ['ShortName', 'FriendlyName', 'Locale', 'Gender']
+                    missing_fields = [field for field in required_fields if field not in voice_obj]
+
+                    if missing_fields:
+                        logger.warning(f"语音 {i} 缺少必需字段: {missing_fields}, 跳过此语音")
+                        continue
+
+                    # 安全地获取字段值
+                    short_name = voice_obj.get('ShortName', '')
+                    friendly_name = voice_obj.get('FriendlyName', '')
+                    locale = voice_obj.get('Locale', '')
+                    gender = voice_obj.get('Gender', '')
+
+                    # 验证字段值不为空
+                    if not all([short_name, friendly_name, locale, gender]):
+                        logger.warning(f"语音 {i} 包含空字段值, 跳过此语音")
+                        continue
+
+                    # 安全地提取语言代码
+                    language = locale[:2] if len(locale) >= 2 else 'en'
+
+                    tts_voice = TTSVoice(
+                        id=short_name,
+                        name=friendly_name,
+                        language=language,
+                        gender=gender,
+                        engine=TTSEngine.EDGE,
+                        locale=locale,
+                    )
+                    result.append(tts_voice)
+
+                except Exception as voice_error:
+                    logger.warning(f"处理语音 {i} 时出错: {voice_error}, 跳过此语音")
+                    continue
+
+            logger.info(f"成功获取 {len(result)} 个 Edge TTS 语音")
             return result
+
         except Exception as e:
             logger.error(f"获取 Edge TTS 语音列表失败: {e}")
             return []
@@ -352,18 +385,51 @@ class EdgeTTSProvider(TTSVoiceProvider):
                 asyncio.set_event_loop(loop)
                 voices = loop.run_until_complete(edge_tts.list_voices())
 
+                if not voices:
+                    logger.warning("Edge TTS 同步方式返回空的语音列表")
+                    return []
+
                 result: List[TTSVoice] = []
-                for voice in voices:
-                    voice_obj: Any = voice
-                    tts_voice = TTSVoice(
-                        id=voice_obj['ShortName'],
-                        name=voice_obj['FriendlyName'],
-                        language=voice_obj['Locale'][:2],
-                        gender=voice_obj['Gender'],
-                        engine=TTSEngine.EDGE,
-                        locale=voice_obj['Locale'],
-                    )
-                    result.append(tts_voice)
+                for i, voice in enumerate(voices):
+                    try:
+                        voice_obj: Any = voice
+                        # 验证必需的字段是否存在
+                        required_fields = ['ShortName', 'FriendlyName', 'Locale', 'Gender']
+                        missing_fields = [field for field in required_fields if field not in voice_obj]
+
+                        if missing_fields:
+                            logger.warning(f"语音 {i} 缺少必需字段: {missing_fields}, 跳过此语音")
+                            continue
+
+                        # 安全地获取字段值
+                        short_name = voice_obj.get('ShortName', '')
+                        friendly_name = voice_obj.get('FriendlyName', '')
+                        locale = voice_obj.get('Locale', '')
+                        gender = voice_obj.get('Gender', '')
+
+                        # 验证字段值不为空
+                        if not all([short_name, friendly_name, locale, gender]):
+                            logger.warning(f"语音 {i} 包含空字段值, 跳过此语音")
+                            continue
+
+                        # 安全地提取语言代码
+                        language = locale[:2] if len(locale) >= 2 else 'en'
+
+                        tts_voice = TTSVoice(
+                            id=short_name,
+                            name=friendly_name,
+                            language=language,
+                            gender=gender,
+                            engine=TTSEngine.EDGE,
+                            locale=locale,
+                        )
+                        result.append(tts_voice)
+
+                    except Exception as voice_error:
+                        logger.warning(f"处理语音 {i} 时出错: {voice_error}, 跳过此语音")
+                        continue
+
+                logger.info(f"同步方式成功获取 {len(result)} 个 Edge TTS 语音")
                 return result
             finally:
                 self._safe_cleanup_loop(loop)
