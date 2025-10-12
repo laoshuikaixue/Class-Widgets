@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import aiohttp
 import edge_tts
 import pyttsx3
 from PyQt5.QtCore import QCoreApplication, QObject, pyqtSignal
@@ -302,137 +303,110 @@ class EdgeTTSProvider(TTSVoiceProvider):
     def _fetch_voices(self) -> List[TTSVoice]:
         """获取 Edge TTS 语音列表"""
         try:
-            try:
-                current_loop = asyncio.get_running_loop()
-                if current_loop and not current_loop.is_closed():
-                    with ThreadPoolExecutor() as executor:
-                        future = executor.submit(self._fetch_voices_sync)
-                        return future.result(timeout=10.0)
-            except RuntimeError:
-                pass
-
-            def _run_async():
-                loop = None
-                try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    return loop.run_until_complete(edge_tts.list_voices())
-                except Exception:
-                    raise
-                finally:
-                    self._safe_cleanup_loop(loop)
-
-            future = self._executor.submit(_run_async)
-            voices = future.result(timeout=10.0)
-
-            if not voices:
-                logger.warning("Edge TTS 返回空的语音列表")
-                return []
-
-            result: List[TTSVoice] = []
-            for i, voice in enumerate(voices):
-                try:
-                    voice_obj: Any = voice
-                    # 验证必需的字段是否存在
-                    required_fields = ['ShortName', 'FriendlyName', 'Locale', 'Gender']
-                    missing_fields = [field for field in required_fields if field not in voice_obj]
-
-                    if missing_fields:
-                        logger.warning(f"语音 {i} 缺少必需字段: {missing_fields}, 跳过此语音")
-                        continue
-
-                    # 安全地获取字段值
-                    short_name = voice_obj.get('ShortName', '')
-                    friendly_name = voice_obj.get('FriendlyName', '')
-                    locale = voice_obj.get('Locale', '')
-                    gender = voice_obj.get('Gender', '')
-
-                    # 验证字段值不为空
-                    if not all([short_name, friendly_name, locale, gender]):
-                        logger.warning(f"语音 {i} 包含空字段值, 跳过此语音")
-                        continue
-
-                    # 安全地提取语言代码
-                    language = locale[:2] if len(locale) >= 2 else 'en'
-
-                    tts_voice = TTSVoice(
-                        id=short_name,
-                        name=friendly_name,
-                        language=language,
-                        gender=gender,
-                        engine=TTSEngine.EDGE,
-                        locale=locale,
-                    )
-                    result.append(tts_voice)
-
-                except Exception as voice_error:
-                    logger.warning(f"处理语音 {i} 时出错: {voice_error}, 跳过此语音")
-                    continue
-
-            logger.info(f"成功获取 {len(result)} 个 Edge TTS 语音")
-            return result
-
+            # 直接使用同步方法，避免事件循环冲突
+            return self._fetch_voices_sync()
         except Exception as e:
             logger.error(f"获取 Edge TTS 语音列表失败: {e}")
             return []
 
     def _fetch_voices_sync(self) -> List[TTSVoice]:
         """同步方式获取 Edge TTS 语音列表"""
-        try:
+
+        def _run_async_in_thread():
+            """在独立线程中运行异步操作"""
             loop = None
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                voices = loop.run_until_complete(edge_tts.list_voices())
 
-                if not voices:
-                    logger.warning("Edge TTS 同步方式返回空的语音列表")
+                async def _fetch():
+                    """异步获取语音"""
+                    max_retries = 3
+                    retry_delay = 1.0
+
+                    for attempt in range(max_retries):
+                        try:
+                            # 创建连接器，禁用SSL验证以避免代理问题
+                            connector = aiohttp.TCPConnector(
+                                ssl=False,
+                                limit=10,
+                                limit_per_host=5,
+                                ttl_dns_cache=300,
+                                use_dns_cache=True,
+                                keepalive_timeout=30,
+                                enable_cleanup_closed=True
+                            )
+
+                            # 获取语音列表
+                            voices_data = await edge_tts.list_voices(connector=connector)
+
+                            if not voices_data:
+                                logger.warning("Edge TTS 返回空语音列表")
+                                return []
+
+                            voices = []
+                            for i, voice_data in enumerate(voices_data):
+                                try:
+                                    # 检查必需字段
+                                    required_fields = ['FriendlyName', 'ShortName', 'Locale', 'Gender']
+                                    missing_fields = [field for field in required_fields if field not in voice_data]
+
+                                    if missing_fields:
+                                        logger.warning(f"语音 {i} 缺少必需字段: {missing_fields}, 跳过此语音")
+                                        continue
+
+                                    # 创建 TTSVoice 对象
+                                    voice = TTSVoice(
+                                        id=voice_data['ShortName'],
+                                        name=voice_data['FriendlyName'],
+                                        language=voice_data['Locale'][:2] if voice_data['Locale'] else 'unknown',
+                                        gender=voice_data['Gender'].lower() if voice_data['Gender'] else 'unknown',
+                                        engine=TTSEngine.EDGE,
+                                        locale=voice_data['Locale']
+                                    )
+                                    voices.append(voice)
+
+                                except Exception as e:
+                                    logger.warning(f"处理语音 {i} 时出错: {e}")
+                                    continue
+
+                            logger.info(f"成功获取 {len(voices)} 个 Edge TTS 语音")
+                            return voices
+
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"获取 Edge TTS 语音失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                                await asyncio.sleep(retry_delay)
+                            else:
+                                logger.error(f"获取 Edge TTS 语音失败 (最终尝试): {e}")
+                                raise
+
                     return []
 
-                result: List[TTSVoice] = []
-                for i, voice in enumerate(voices):
+                # 运行异步函数
+                try:
+                    return loop.run_until_complete(asyncio.wait_for(_fetch(), timeout=30))
+                finally:
+                    # 清理事件循环
                     try:
-                        voice_obj: Any = voice
-                        # 验证必需的字段是否存在
-                        required_fields = ['ShortName', 'FriendlyName', 'Locale', 'Gender']
-                        missing_fields = [field for field in required_fields if field not in voice_obj]
+                        pending = asyncio.all_tasks(loop)
+                        if pending:
+                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    except Exception:
+                        pass
+                    finally:
+                        loop.close()
 
-                        if missing_fields:
-                            logger.warning(f"语音 {i} 缺少必需字段: {missing_fields}, 跳过此语音")
-                            continue
-
-                        # 安全地获取字段值
-                        short_name = voice_obj.get('ShortName', '')
-                        friendly_name = voice_obj.get('FriendlyName', '')
-                        locale = voice_obj.get('Locale', '')
-                        gender = voice_obj.get('Gender', '')
-
-                        # 验证字段值不为空
-                        if not all([short_name, friendly_name, locale, gender]):
-                            logger.warning(f"语音 {i} 包含空字段值, 跳过此语音")
-                            continue
-
-                        # 安全地提取语言代码
-                        language = locale[:2] if len(locale) >= 2 else 'en'
-
-                        tts_voice = TTSVoice(
-                            id=short_name,
-                            name=friendly_name,
-                            language=language,
-                            gender=gender,
-                            engine=TTSEngine.EDGE,
-                            locale=locale,
-                        )
-                        result.append(tts_voice)
-
-                    except Exception as voice_error:
-                        logger.warning(f"处理语音 {i} 时出错: {voice_error}, 跳过此语音")
-                        continue
-
-                logger.info(f"同步方式成功获取 {len(result)} 个 Edge TTS 语音")
-                return result
+            except Exception as e:
+                logger.error(f"线程中异步操作失败: {e}")
+                return []
             finally:
                 self._safe_cleanup_loop(loop)
+
+        try:
+            # 使用线程池执行异步操作
+            future = self._executor.submit(_run_async_in_thread)
+            return future.result(timeout=35.0)
         except Exception as e:
             logger.error(f"同步获取 Edge TTS 语音列表失败: {e}")
             return []
@@ -440,38 +414,93 @@ class EdgeTTSProvider(TTSVoiceProvider):
     def synthesize(self, text: str, voice_id: str, output_path: str, speed: float = 1.0) -> bool:
         """合成 Edge TTS 语音"""
         try:
-
             def _run_synthesis():
-                loop = None
+                """在独立线程中运行异步合成操作"""
                 try:
+                    # 创建新的事件循环
                     loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    rate_percent = int((speed - 1) * 100)
-                    rate_str = f"{rate_percent:+d}%" if rate_percent != 0 else "+0%"
-                    if not text or not text.strip():
-                        raise ValueError(
-                            QCoreApplication.translate("EdgeTTSProvider", "文本内容不能为空")
-                        )
-                    if not voice_id:
-                        raise ValueError(
-                            QCoreApplication.translate("EdgeTTSProvider", "语音ID不能为空")
-                        )
-                    communicate = edge_tts.Communicate(text=text, voice=voice_id, rate=rate_str)
-                    result = loop.run_until_complete(communicate.save(output_path))
-                    if not os.path.exists(output_path):
-                        raise RuntimeError(
-                            QCoreApplication.translate(
-                                "EdgeTTSProvider", "语音文件生成失败，文件不存在"
+
+                    async def _synthesize():
+                        """异步合成语音"""
+                        rate_percent = int((speed - 1) * 100)
+                        rate_str = f"{rate_percent:+d}%" if rate_percent != 0 else "+0%"
+
+                        if not text or not text.strip():
+                            raise ValueError(
+                                QCoreApplication.translate("EdgeTTSProvider", "文本内容不能为空")
                             )
-                        )
-                    if os.path.getsize(output_path) == 0:
-                        raise RuntimeError(
-                            QCoreApplication.translate(
-                                "EdgeTTSProvider", "语音文件生成失败，文件为空"
+                        if not voice_id:
+                            raise ValueError(
+                                QCoreApplication.translate("EdgeTTSProvider", "语音ID不能为空")
                             )
+
+                        # 创建连接器，禁用SSL验证以避免代理问题
+                        connector = aiohttp.TCPConnector(
+                            ssl=False,
+                            limit=10,
+                            limit_per_host=5,
+                            ttl_dns_cache=300,
+                            use_dns_cache=True,
+                            keepalive_timeout=30,
+                            enable_cleanup_closed=True
                         )
 
-                    return result
+                        # 多次重试合成语音
+                        max_retries = 2
+                        for attempt in range(max_retries):
+                            try:
+                                logger.info(f"尝试合成Edge TTS语音 (第 {attempt + 1}/{max_retries} 次)")
+                                communicate = edge_tts.Communicate(
+                                    text=text,
+                                    voice=voice_id,
+                                    rate=rate_str
+                                )
+                                await communicate.save(output_path)
+
+                                # 验证文件是否成功生成
+                                if not os.path.exists(output_path):
+                                    raise RuntimeError(
+                                        QCoreApplication.translate(
+                                            "EdgeTTSProvider", "语音文件生成失败，文件不存在"
+                                        )
+                                    )
+                                if os.path.getsize(output_path) == 0:
+                                    raise RuntimeError(
+                                        QCoreApplication.translate(
+                                            "EdgeTTSProvider", "语音文件生成失败，文件为空"
+                                        )
+                                    )
+
+                                logger.info(f"Edge TTS语音合成成功 (第 {attempt + 1} 次尝试)")
+                                return True
+
+                            except Exception as e:
+                                logger.warning(f"第 {attempt + 1} 次合成尝试失败: {e}")
+                                if attempt < max_retries - 1:
+                                    await asyncio.sleep(1)  # 等待1秒后重试
+                                    # 清理失败的文件
+                                    if os.path.exists(output_path):
+                                        with contextlib.suppress(builtins.BaseException):
+                                            os.remove(output_path)
+                                else:
+                                    raise
+
+                        return False
+
+                    # 运行异步函数
+                    try:
+                        return loop.run_until_complete(asyncio.wait_for(_synthesize(), timeout=20))
+                    finally:
+                        # 清理事件循环
+                        try:
+                            pending = asyncio.all_tasks(loop)
+                            if pending:
+                                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                        except Exception:
+                            pass
+                        finally:
+                            loop.close()
+                            
                 except Exception as e:
                     error_msg = str(e)
                     if "No audio was received" in error_msg:
@@ -498,12 +527,10 @@ class EdgeTTSProvider(TTSVoiceProvider):
                             "EdgeTTSProvider", "Edge TTS合成失败: {}"
                         ).format(error_msg)
                     )
-                finally:
-                    self._safe_cleanup_loop(loop)
 
             future = self._executor.submit(_run_synthesis)
-            future.result(timeout=20.0)
-            return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+            result = future.result(timeout=25.0)
+            return result and os.path.exists(output_path) and os.path.getsize(output_path) > 0
         except Exception as e:
             logger.error(f"Edge TTS 合成失败: {e}")
             if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
