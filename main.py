@@ -14,8 +14,6 @@ from shutil import copy
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import psutil
-from loguru import logger
-from packaging.version import Version
 from PyQt5 import uic
 from PyQt5.QtCore import (
     QCoreApplication,
@@ -57,6 +55,8 @@ from PyQt5.QtWidgets import (
     QSystemTrayIcon,
     QWidget,
 )
+from loguru import logger
+from packaging.version import Version
 from qfluentwidgets import (
     Action,
     CheckBox,
@@ -481,21 +481,21 @@ def get_countdown(toast: bool = False) -> Optional[List[Union[str, int]]]:  # �
                         else:
                             after_school()
 
+                    # 预备铃（课前提醒）：晚修第一节课固定 25 分钟，其他课程按设置
+                    prepare_enabled = config_center.read_conf('Toast', 'prepare_class') == '1'
+                    is_evening_first = (part == 2 and not isbreak and _item_index == 1)
+                    prepare_minutes_cfg = int(config_center.read_conf('Toast', 'prepare_minutes'))
+                    effective_minutes = 25 if (is_evening_first and prepare_enabled) else prepare_minutes_cfg
                     if (
-                        (
-                            current_dt
-                            == c_time
-                            - dt.timedelta(
-                                minutes=int(config_center.read_conf('Toast', 'prepare_minutes'))
-                            )
+                            current_dt == c_time - dt.timedelta(minutes=effective_minutes)
                             and current_dt != last_notify_time
-                        )
-                        and (
-                            config_center.read_conf('Toast', 'prepare_minutes') != '0'
                             and toast
                             and not isbreak
-                        )
                         and not current_state
+                            and (
+                            (is_evening_first and prepare_enabled)
+                            or (not is_evening_first and prepare_minutes_cfg != 0)
+                    )
                     ):  # 课间
                         if can_send_notification(3, next_lessons[0]):
                             notification.push_notification(3, next_lessons[0])  # 准备上课（预备铃）
@@ -535,10 +535,15 @@ def get_countdown(toast: bool = False) -> Optional[List[Union[str, int]]]:  # �
             if not return_text:
                 return_text = [QCoreApplication.translate('main', '目前课程已结束'), '00:00', 100]
         else:
+            # 预备铃（课前提醒）：晚修第一节课固定 25 分钟，其他课程按设置
+            prepare_enabled = config_center.read_conf('Toast', 'prepare_class') == '1'
             prepare_minutes_str = config_center.read_conf('Toast', 'prepare_minutes')
-            if prepare_minutes_str != '0' and toast:
-                prepare_minutes = int(prepare_minutes_str)
-                if current_dt == c_time - dt.timedelta(minutes=prepare_minutes):
+            prepare_minutes_cfg = int(prepare_minutes_str)
+            is_evening = part == 2
+            use_special = is_evening and prepare_enabled
+            if (use_special or prepare_minutes_str != '0') and toast:
+                effective_minutes = 25 if use_special else prepare_minutes_cfg
+                if current_dt == c_time - dt.timedelta(minutes=effective_minutes):
                     next_lesson_name = None
                     next_lesson_key = None
                     if timeline_data:
